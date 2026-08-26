@@ -3439,8 +3439,10 @@ async def get_invalid_calendar_period_pages():
 async def get_chat_messages_for_date(date_str: str):
     """读取指定日期的所有聊天消息（用于生成日页面，排除项目对话）"""
     from datetime import date as date_cls
+
     pool = await get_pool()
     d = date_cls.fromisoformat(date_str)
+
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT m.role, m.content, m.time, m.conversation_id
@@ -3452,6 +3454,23 @@ async def get_chat_messages_for_date(date_str: str):
               AND c.project_id IS NULL
             ORDER BY m.time ASC
         """, d)
+
+        # 普通 OpenAI 客户端（如 Kelivo）没有走 /sync/* 时，
+        # 从 conversations 读取当天的普通聊天记录。
+        if not rows:
+            rows = await conn.fetch("""
+                SELECT
+                    role,
+                    content,
+                    created_at AS time,
+                    session_id AS conversation_id
+                FROM conversations
+                WHERE (created_at AT TIME ZONE 'Asia/Shanghai')::date = $1
+                  AND role IN ('user', 'assistant')
+                  AND content != ''
+                ORDER BY created_at ASC
+            """, d)
+
     return [dict(r) for r in rows]
 
 
