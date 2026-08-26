@@ -1759,7 +1759,13 @@ async def chat_completions(request: Request):
     # v5.8：项目 ID（前端传来，用于项目指令/记忆/文件注入）
     project_id = body.pop('project_id', None) or None
     # v6.0：前端对话 ID，用于无缝换窗时避免衔接到当前对话自身
-    conversation_id = body.pop('conversation_id', None) or None
+    conversation_id = (
+    body.pop('conversation_id', None)
+    or request.headers.get('X-Conversation-Id')
+    or None
+)
+if isinstance(conversation_id, str):
+    conversation_id = conversation_id.strip() or None
     is_regenerate = bool(body.pop('is_regenerate', False))
 
     # 先确定最终模型，后面的 prompt cache 判断要用它。
