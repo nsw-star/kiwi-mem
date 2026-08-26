@@ -4301,6 +4301,50 @@ async def search_chat_messages(query: str, project_id: str = None, limit: int = 
                 "date": tr["created_at"].isoformat() if tr["created_at"] else None,
             })
         
+        # 普通 OpenAI 客户端（如 Kelivo）没有走 /sync/* 时，
+        # chat_messages 可能为空；此时回退搜索 conversations 表。
+        if not results_by_conv and (project_id is None or project_id == 'none'):
+            legacy_rows = await conn.fetch("""
+                SELECT id, session_id, role, content, created_at
+                FROM conversations
+                WHERE content ILIKE $1
+                  AND role IN ('user', 'assistant')
+                ORDER BY created_at DESC
+                LIMIT $2
+            """, f"%{query.strip()}%", limit)
+
+            legacy_by_session = {}
+
+            for row in legacy_rows:
+                session_id = row["session_id"]
+
+                if session_id not in legacy_by_session:
+                    legacy_by_session[session_id] = {
+                        "conversation_id": session_id,
+                        "title": "Kelivo 对话",
+                        "project_id": None,
+                        "date": row["created_at"].isoformat() if row["created_at"] else None,
+                        "matches": [],
+                    }
+
+                content = row["content"] or ""
+                if len(content) > 300:
+                    content = content[:300] + "…"
+
+                legacy_by_session[session_id]["matches"].append({
+                    "message_id": str(row["id"]),
+                    "sort_order": row["id"],
+                    "context": [{
+                        "id": str(row["id"]),
+                        "role": row["role"],
+                        "content": content,
+                        "time": row["created_at"].isoformat() if row["created_at"] else None,
+                        "is_match": True,
+                    }],
+                })
+
+            results_by_conv.update(legacy_by_session)
+
         return {
             "title_matches": title_matches,
             "message_matches": list(results_by_conv.values()),
