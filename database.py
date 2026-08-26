@@ -978,7 +978,31 @@ async def get_handoff_source(exclude_conversation_id: str = None, project_id: st
             ORDER BY c.updated_at DESC
             LIMIT 1
         """, exclude_conversation_id, project_id)
-        return dict(conv) if conv else None
+
+        if conv:
+            return dict(conv)
+
+        # 普通 OpenAI 客户端（如 Kelivo）不会写入 /sync/* 对话表。
+        # 非项目对话时，回退到 conversations，按 session_id 找最近的完整窗口。
+        if project_id is not None:
+            return None
+
+        legacy = await conn.fetchrow("""
+            SELECT
+                session_id AS id,
+                'Kelivo 对话'::text AS title,
+                NULL::text AS project_id,
+                MAX(created_at) AS updated_at
+            FROM conversations
+            WHERE ($1::text IS NULL OR session_id <> $1)
+              AND role IN ('user', 'assistant')
+            GROUP BY session_id
+            HAVING COUNT(*) >= 4
+            ORDER BY MAX(created_at) DESC
+            LIMIT 1
+        """, exclude_conversation_id)
+
+        return dict(legacy) if legacy else None
 
 
 async def get_handoff_data(source_conversation_id: str, tail_count: int = 6):
@@ -997,6 +1021,7 @@ async def get_handoff_data(source_conversation_id: str, tail_count: int = 6):
             ORDER BY compressed_at DESC, id DESC
             LIMIT 1
         """, source_conversation_id)
+
         rows = await conn.fetch("""
             SELECT role, content, summary, sort_order, time
             FROM chat_messages
@@ -1005,8 +1030,24 @@ async def get_handoff_data(source_conversation_id: str, tail_count: int = 6):
             ORDER BY sort_order ASC, time ASC
         """, source_conversation_id)
 
+        # Kelivo 普通聊天没有走 /sync/* 时，从 conversations 读取同一窗口。
+        if not rows:
+            rows = await conn.fetch("""
+                SELECT
+                    role,
+                    content,
+                    NULL::text AS summary,
+                    id AS sort_order,
+                    created_at AS time
+                FROM conversations
+                WHERE session_id = $1
+                  AND role IN ('user', 'assistant')
+                ORDER BY id ASC, created_at ASC
+            """, source_conversation_id)
+
     messages = [dict(r) for r in rows]
     last_div_idx = -1
+
     for idx, msg in enumerate(messages):
         if msg.get("role") == "divider":
             last_div_idx = idx
@@ -1019,15 +1060,24 @@ async def get_handoff_data(source_conversation_id: str, tail_count: int = 6):
         m for m in (messages[last_div_idx + 1:] if last_div_idx >= 0 else [])
         if m.get("role") in ("user", "assistant")
     ]
-    ua_msgs = [m for m in messages if m.get("role") in ("user", "assistant")]
+
+    ua_msgs = [
+        m for m in messages
+        if m.get("role") in ("user", "assistant")
+    ]
 
     safe_tail_count = max(0, int(tail_count or 0))
     tail_source = uncompressed if last_div_idx >= 0 else ua_msgs
     tail_messages = tail_source[-safe_tail_count:] if safe_tail_count else []
 
     comp_summary = comp["summary"] if comp else None
+
     return {
-        "comp_summary": (comp_summary.strip() if isinstance(comp_summary, str) and comp_summary.strip() else None),
+        "comp_summary": (
+            comp_summary.strip()
+            if isinstance(comp_summary, str) and comp_summary.strip()
+            else None
+        ),
         "divider_summary": divider_summary,
         "has_divider": last_div_idx >= 0,
         "uncompressed": uncompressed,
